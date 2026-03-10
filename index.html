@@ -537,6 +537,18 @@
         <input type="checkbox" id="opt-include-title" checked>
         Include title in filename
       </label>
+      <label class="opt">
+        <input type="checkbox" id="opt-memes" checked>
+        Include memes
+      </label>
+      <label class="opt">
+        <input type="checkbox" id="opt-stickers" checked>
+        Include stickers
+      </label>
+      <label class="opt">
+        <input type="checkbox" id="opt-mp4">
+        Download GIFs as .mp4
+      </label>
     </div>
   </div>
 
@@ -665,7 +677,7 @@ function reset() {
 }
 
 // ── API ───────────────────────────────────────────────────────────────────────
-async function fetchAllGifs(username) {
+async function fetchAll(username, searchfilter, labelPrefix) {
   const records = [];
   let pos = null;
 
@@ -675,8 +687,9 @@ async function fetchAllGifs(username) {
       client_key:   CLIENT_KEY,
       q:            `@${username}`,
       limit:        LIMIT,
-      media_filter: "gif,mediumgif,tinygif",
+      media_filter: "gif,mediumgif,tinygif,webp,tinywebp,mp4",
     });
+    if (searchfilter) params.set("searchfilter", searchfilter);
     if (pos) params.set("pos", pos);
 
     const r    = await fetch(`${API_BASE}/search?${params}`);
@@ -686,9 +699,8 @@ async function fetchAllGifs(username) {
     if (!batch.length) break;
     records.push(...batch);
 
-    setCount(records.length);
-    setMsg(`Found ${records.length} GIFs so far...`);
-    log(`page fetched — ${records.length} total`, "log-info");
+    setMsg(`${labelPrefix}: found ${records.length} so far...`);
+    log(`${labelPrefix} page — ${records.length} total`, "log-info");
 
     const next = data.next || "";
     if (!next || next === pos) break;
@@ -700,8 +712,14 @@ async function fetchAllGifs(username) {
   return records;
 }
 
-function getGifUrl(record, bestQuality) {
+function getUrl(record, bestQuality, isSticker, asMp4) {
   const fmt = record.media_formats || {};
+  if (isSticker) {
+    return fmt.webp?.url || fmt.tinywebp?.url || fmt.gif?.url || null;
+  }
+  if (asMp4) {
+    return fmt.mp4?.url || null;
+  }
   const order = bestQuality
     ? ["gif", "mediumgif", "tinygif"]
     : ["tinygif", "mediumgif", "gif"];
@@ -717,13 +735,57 @@ function safeFilename(text, max = 60) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+async function downloadBatch(records, folder, bestQuality, isSticker, includeTitle, totalOverall, doneCountRef, asMp4) {
+  let ok = 0;
+  for (let i = 0; i < records.length; i++) {
+    if (aborted) break;
+
+    const rec      = records[i];
+    const id       = rec.id || String(i);
+    const title    = (rec.h1_title || rec.title || "").trim();
+    const namePart = includeTitle && title ? safeFilename(title) + "_" : "";
+    const ext      = isSticker ? "webp" : asMp4 ? "mp4" : "gif";
+    const filename = `${namePart}${id}.${ext}`;
+
+    const url = getUrl(rec, bestQuality, isSticker, asMp4);
+    if (!url) {
+      log(`✗ no url — ${id}`, "log-err");
+      doneCountRef.n++;
+      continue;
+    }
+
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const blob = await resp.arrayBuffer();
+      folder.file(filename, blob);
+      ok++;
+      log(`✓ ${filename}`, "log-ok");
+    } catch (e) {
+      log(`✗ ${filename} — ${e.message}`, "log-err");
+    }
+
+    doneCountRef.n++;
+    const pct = 10 + Math.round((doneCountRef.n / totalOverall) * 87);
+    setProgress(pct);
+    setCount(doneCountRef.n, totalOverall);
+    setMsg(filename);
+
+    if (doneCountRef.n % 10 === 0) await sleep(300);
+  }
+  return ok;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function start() {
-  const username = $("username").value.trim().replace(/^@/, "");
+  const username     = $("username").value.trim().replace(/^@/, "");
   if (!username) { $("username").focus(); return; }
 
-  const bestQuality   = $("opt-best").checked;
-  const includeTitle  = $("opt-include-title").checked;
+  const bestQuality  = $("opt-best").checked;
+  const includeTitle = $("opt-include-title").checked;
+  const wantMemes    = $("opt-memes").checked;
+  const wantStickers = $("opt-stickers").checked;
+  const asMp4        = $("opt-mp4").checked;
 
   reset();
   aborted = false;
@@ -734,68 +796,69 @@ async function start() {
   showStatus();
 
   try {
-    // Phase 1: Fetch list
-    setPhase("Fetching GIF list...");
+    // Phase 1: Fetch all lists
+    setPhase("Fetching content list...");
     setProgress(5);
     log(`starting @${username}`, "log-info");
 
-    const records = await fetchAllGifs(username);
+    const allRecords = await fetchAll(username, null, "GIFs");
+    if (aborted) { reset(); return; }
 
-    if (!records.length) {
-      showError(`No GIFs found for @${username}. Check the username and try again.`);
-      $("go-btn").disabled = false;
-      $("go-btn").innerHTML = "GRAB";
+    const gifRecords = allRecords.filter(r => !r.flags?.includes("sticker"));
+    let memeRecords    = [];
+    let stickerRecords = [];
+
+    if (wantMemes) {
+      setMsg("Fetching memes...");
+      memeRecords = await fetchAll(username, "static", "Memes");
+      if (aborted) { reset(); return; }
+    }
+
+    if (wantStickers) {
+      setMsg("Fetching stickers...");
+      stickerRecords = await fetchAll(username, "sticker", "Stickers");
+      if (aborted) { reset(); return; }
+    }
+
+    const totalItems = gifRecords.length + memeRecords.length + stickerRecords.length;
+
+    if (!totalItems) {
+      showError(`Nothing found for @${username}. Check the username and try again.`);
+      $("go-btn").disabled   = false;
+      $("go-btn").innerHTML  = "GRAB";
       $("username").disabled = false;
+      $("stop-btn").style.display = "none";
       return;
     }
 
-    const total = records.length;
-    log(`total: ${total} GIFs found`, "log-info");
+    log(`GIFs: ${gifRecords.length} · Memes: ${memeRecords.length} · Stickers: ${stickerRecords.length}`, "log-info");
 
-    // Phase 2: Download & ZIP
-    setPhase("Downloading & zipping...");
-    setCount(0, total);
+    // Phase 2: Download into folders
+    setPhase("Downloading...");
+    setCount(0, totalItems);
     setProgress(10);
 
-    const zip = new JSZip();
-    const folder = zip.folder(username);
-    let ok = 0, failed = 0;
+    const zip           = new JSZip();
+    const gifFolder     = zip.folder(`${username}_tenor/gifs`);
+    const memeFolder    = zip.folder(`${username}_tenor/memes`);
+    const stickerFolder = zip.folder(`${username}_tenor/stickers`);
+    const done          = { n: 0 };
+    let totalOk         = 0;
 
-    for (let i = 0; i < records.length; i++) {
-      if (aborted) break;
+    setMsg("Downloading GIFs...");
+    totalOk += await downloadBatch(gifRecords, gifFolder, bestQuality, false, includeTitle, totalItems, done, asMp4);
+    if (aborted) { reset(); return; }
 
-      const rec   = records[i];
-      const id    = rec.id || String(i);
-      const title = (rec.h1_title || rec.title || "").trim();
-      const namePart = includeTitle && title ? safeFilename(title) + "_" : "";
-      const filename  = `${namePart}${id}.gif`;
+    if (memeRecords.length) {
+      setMsg("Downloading Memes...");
+      totalOk += await downloadBatch(memeRecords, memeFolder, bestQuality, false, includeTitle, totalItems, done, false);
+      if (aborted) { reset(); return; }
+    }
 
-      const url = getGifUrl(rec, bestQuality);
-      if (!url) {
-        log(`✗ no url — ${id}`, "log-err");
-        failed++;
-        continue;
-      }
-
-      try {
-        const resp = await fetch(url);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const blob = await resp.arrayBuffer();
-        folder.file(filename, blob);
-        ok++;
-        log(`✓ ${filename}`, "log-ok");
-      } catch (e) {
-        log(`✗ ${filename} — ${e.message}`, "log-err");
-        failed++;
-      }
-
-      const pct = 10 + Math.round((i + 1) / total * 85);
-      setProgress(pct);
-      setCount(i + 1, total);
-      setMsg(filename);
-
-      // small pause every 10 to avoid hammering
-      if (i > 0 && i % 10 === 0) await sleep(300);
+    if (stickerRecords.length) {
+      setMsg("Downloading Stickers...");
+      totalOk += await downloadBatch(stickerRecords, stickerFolder, true, true, includeTitle, totalItems, done, false);
+      if (aborted) { reset(); return; }
     }
 
     // Phase 3: Build ZIP
@@ -809,7 +872,7 @@ async function start() {
     setMsg("Done!");
     log(`zip ready — ${(zipBlob.size/1024/1024).toFixed(1)} MB`, "log-info");
 
-    showDone(username, ok, total, zipBlob);
+    showDone(username, totalOk, totalItems, zipBlob);
 
   } catch (e) {
     showError(e.message || "Something went wrong.");
